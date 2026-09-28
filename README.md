@@ -1,8 +1,8 @@
-# 📖 Ultra-Low-Power E-Paper PDF Reader (LilyGo T5 4.7" S3)
+# 📖 Ultra-Low-Power E-Paper Book Reader (LilyGo T5 4.7" S3)
 
-Complete ultra-low-power PDF reader system based on the **LilyGo T5 4.7" S3** board (ESP32-S3 + ED047TC1 e-paper display).
+Complete ultra-low-power book reader system based on the **LilyGo T5 4.7" S3** board (ESP32-S3 + ED047TC1 e-paper display).
 
-The system architecture relies on pre-rendering PDF pages on a host computer into an optimized 4-bit binary format stored on a MicroSD card. The ESP32-S3 wakes up solely to stream the page directly into PSRAM, refresh the e-paper display, commit the bookmark to non-volatile flash memory (NVS), and immediately plunges back into deep sleep (**Deep Sleep < 20 µA**).
+The system architecture relies on pre-rendering PDF or E-PUB pages on a host computer into an optimized 4-bit binary format stored on a MicroSD card. The ESP32-S3 wakes up solely to stream the page directly into PSRAM, refresh the e-paper display, commit the bookmark to non-volatile flash memory (NVS), and immediately plunges back into deep sleep (**Deep Sleep < 20 µA**).
 
 ---
 
