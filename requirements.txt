@@ -1,0 +1,3 @@
+# Python dependencies for LilyGo T5 S3 E-Paper PDF Reader toolchain
+pymupdf>=1.23.0
+Pillow>=10.0.0
