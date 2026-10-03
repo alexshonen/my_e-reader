@@ -43,15 +43,15 @@ TARGET_WIDTH = 540
 TARGET_HEIGHT = 960
 EXPECTED_BYTE_SIZE = (TARGET_WIDTH * TARGET_HEIGHT) // 2  # 259,200 bytes
 
-# Font size presets (similar to Kindle / Kobo typography settings)
+# Font size presets (scaled up for 4.7" 234 PPI e-paper visibility)
 FONT_PRESETS = {
-    "xsmall": 10.0,
-    "small": 12.0,
-    "medium": 14.0,
-    "default": 14.0,
-    "large": 17.0,
-    "xlarge": 21.0,
-    "xxlarge": 26.0,
+    "xsmall": 14.0,
+    "small": 17.0,
+    "medium": 21.0,
+    "default": 21.0,
+    "large": 28.0,
+    "xlarge": 36.0,
+    "xxlarge": 48.0,
 }
 
 
@@ -200,8 +200,8 @@ def main():
     parser.add_argument(
         "--font-size", "-s", "--fontsize",
         type=str,
-        default="14",
-        help="Text size for EPUB / reflowable books (e.g. 12, 14, 16, 18 or presets: 'small', 'medium', 'large', 'xlarge'). Default: 14."
+        default="default",
+        help="Text size for EPUB / reflowable books (presets: 'small', 'medium', 'large', 'xlarge', 'xxlarge'). Default: 'default' (medium)."
     )
     parser.add_argument(
         "--contrast", "-c",
@@ -304,7 +304,12 @@ def main():
         print(f"  [OK] Page {page_idx+1:>4} -> {out_filename} ({len(packed_data):,} bytes)")
 
     doc.close()
-    print(f"\n[DONE] Successfully generated {successful_count} page(s) in '{output_dir}'")
+    
+    pages_file = output_dir / "pages.txt"
+    with open(pages_file, "w", encoding="utf-8") as pf:
+        pf.write(str(successful_count) + "\n")
+
+    print(f"\n[DONE] Successfully generated {successful_count} page(s) in '{output_dir}' (Metadata saved)")
     print(f"       To read on your device:")
     print(f"       - Multi-book: Copy '{output_dir}' into '/books/' on your MicroSD card.")
     print(f"       - Single-book: Copy the .bin files directly into '/pages/' on your MicroSD card.")

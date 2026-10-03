@@ -10,8 +10,8 @@
  *      * Tap right half (x >= 220, y >= 120): Page suivante (Next Page)
  *      * Tap left half  (x < 220,  y >= 120): Page precedente (Previous Page)
  *      * Tap top header (y < 120): Ouvrir la bibliotheque (Open Library Menu)
- *  - Touch wakeup: touching the screen wakes the ESP32-S3 from deep sleep
- *  - BOOT button fallback: short press = next page, long press (>1.2s) = open library
+ *  - Responsive reading loop with automatic Deep Sleep after 3 minutes of inactivity
+ *  - Wakeup from Deep Sleep via physical buttons (BOOT or side BUTTON_1)
  *  - Per-book bookmark persistence in Flash NVS (Preferences.h)
  *  - Octal PSRAM framebuffer allocation (ps_malloc) & ultra-deep sleep (<20uA)
  */
@@ -25,28 +25,24 @@
 #include "epd_driver.h"
 #include "esp_sleep.h"
 #include "gui.h"
-#include "touch_gt911.h"
+#include <TouchDrvGT911.hpp>
+#include "utilities.h"
 
-// Instantiate Global Touch Controller
-TouchGT911 Touch;
+// Instantiate Global Touch Controller (SensorLib)
+TouchDrvGT911 touch;
+bool touch_available = false;
 
-// MicroSD Dedicated SPI Bus Pins (LilyGo T5 4.7" S3)
-constexpr int SD_SCK  = 39;
-constexpr int SD_MOSI = 40;
-constexpr int SD_MISO = 41;
-constexpr int SD_CS   = 42;
-
-// Page Turn Button (BOOT button, Active LOW)
-constexpr gpio_num_t BUTTON_PIN = GPIO_NUM_0;
+// Physical Buttons (Active LOW)
+constexpr gpio_num_t BOOT_BUTTON_PIN = GPIO_NUM_0;
+#if defined(BUTTON_1)
+constexpr gpio_num_t SIDE_BUTTON_PIN = (gpio_num_t)BUTTON_1; // GPIO 21 on T5 S3
+#else
+constexpr gpio_num_t SIDE_BUTTON_PIN = GPIO_NUM_21;
+#endif
 
 // Display Framebuffer Dimension Constants (540x960, 4-bit)
-constexpr size_t PAGE_BUFFER_SIZE = (EPD_WIDTH * EPD_HEIGHT / 2); // 259,200 bytes
+constexpr size_t PAGE_BUFFER_SIZE = (PORTRAIT_WIDTH * PORTRAIT_HEIGHT / 2); // 259,200 bytes
 
-// MicroSD SPI Clock Frequency (20 MHz)
-constexpr uint32_t SD_SPI_FREQ = 20000000;
-
-// Dedicated custom SPI bus instance
-SPIClass sd_spi(FSPI);
 
 // Multi-Book Management Constants & State
 constexpr int MAX_BOOKS = 24;
@@ -55,35 +51,138 @@ BookMetadata books[MAX_BOOKS];
 int total_books = 0;
 int current_book_idx = 0;
 
+// Inactivity timeout before entering ultra-low power Deep Sleep (3 minutes)
+constexpr uint32_t INACTIVITY_TIMEOUT_MS = 180000;
+uint32_t last_activity_time = 0;
+
+// Framebuffer pointer in PSRAM
+uint8_t *framebuffer = nullptr;
+
 // Operating Modes
 enum ReaderMode {
     MODE_READING = 0,
     MODE_LIBRARY = 1
 };
-ReaderMode current_mode = MODE_READING;
+ReaderMode current_mode = MODE_LIBRARY;
+
+uint32_t hash_string(const char *str) {
+    uint32_t hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    return hash;
+}
+
+void run_library_menu(uint8_t *fb);
+void render_current_book_page(uint8_t *fb);
+/**
+ * @brief Initializes the GT911 capacitive touch panel.
+ */
+void init_touch() {
+    Wire.begin(BOARD_SDA, BOARD_SCL);
+
+    // Pulse interrupt pin to wake controller if it was sleeping
+    pinMode(TOUCH_INT, OUTPUT);
+    digitalWrite(TOUCH_INT, HIGH);
+    delay(10);
+
+    uint8_t touchAddress = 0;
+    Wire.beginTransmission(0x14);
+    if (Wire.endTransmission() == 0) touchAddress = 0x14;
+    Wire.beginTransmission(0x5D);
+    if (Wire.endTransmission() == 0) touchAddress = 0x5D;
+
+    if (touchAddress != 0) {
+        touch.setPins(-1, TOUCH_INT);
+        if (touch.begin(Wire, touchAddress, BOARD_SDA, BOARD_SCL)) {
+            touch.setMaxCoordinates(PORTRAIT_WIDTH, PORTRAIT_HEIGHT);
+            touch_available = true;
+            Serial.printf("[TOUCH] GT911 detected and initialized at I2C address 0x%02X\n", touchAddress);
+            return;
+        }
+    }
+
+    Serial.println(F("[TOUCH] Warning: GT911 touch not detected. Using physical buttons."));
+    touch_available = false;
+}
 
 /**
- * @brief Enters deep sleep with both Touch INT and BOOT button configured as wakeup triggers.
+ * @brief Reads touch point coordinates from GT911 controller.
+ * @return true if an active touch was registered.
  */
-void enter_deep_sleep() {
-    Serial.println(F("[PWR] Arming Touch and Button wakeups. Entering deep sleep..."));
-    Serial.flush();
+bool read_touch_point(int16_t *x, int16_t *y) {
+    if (!touch_available) return false;
+    int16_t rx[2] = {0}, ry[2] = {0};
+    uint8_t n = touch.getPoint(rx, ry, 1);
+    if (n > 0) {
+        // Raw touch coordinates perfectly align with the visually inverted screen!
+        *x = rx[0];
+        *y = ry[0];
 
-    // Prepare touch controller for low-power gesture/tap detection
-    Touch.prepare_for_sleep();
+        // Constrain coordinates to portrait screen boundaries
+        if (*x < 0) *x = 0;
+        if (*x >= PORTRAIT_WIDTH) *x = PORTRAIT_WIDTH - 1;
+        if (*y < 0) *y = 0;
+        if (*y >= PORTRAIT_HEIGHT) *y = PORTRAIT_HEIGHT - 1;
+        return true;
+    }
+    return false;
+}
 
-    // Enable EXT1 wakeup: triggers on LOW logic level on BOOT button (GPIO 0)
-    // or Touch Interrupt (GPIO 16 or GPIO 21)
-    uint64_t wakeup_mask = (1ULL << BUTTON_PIN) | 
-                           (1ULL << TOUCH_INT_PIN) | 
-                           (1ULL << TOUCH_INT_ALT_PIN);
-    esp_sleep_enable_ext1_wakeup(wakeup_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+/**
+ * @brief Checks if any physical button (BOOT or side button) is pressed.
+ */
+bool is_any_button_pressed() {
+    // Disabled to prevent phantom button loop (we rely on Touch instead)
+    return false;
+}
 
-    // Also configure EXT0 on BOOT button for absolute redundancy
-    esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
+bool is_locked = false;
 
-    // Enter deep sleep: display remains visible indefinitely with zero power draw
-    esp_deep_sleep_start();
+void toggle_lock_state() {
+    if (is_locked) {
+        Serial.println(F("[LOCK] Unlocking device... Resuming reading."));
+        is_locked = false;
+        render_current_book_page(framebuffer);
+        last_activity_time = millis();
+    } else {
+        Serial.println(F("[LOCK] Locking device... Displaying cover page."));
+        is_locked = true;
+        
+        if (total_books > 0 && framebuffer != nullptr) {
+            BookMetadata &b = books[current_book_idx];
+            char filename[120];
+            snprintf(filename, sizeof(filename), "%s/page_0000.bin", b.path);
+            
+            File page_file = SD.open(filename, FILE_READ);
+            if (page_file) {
+                fb_clear(framebuffer, COLOR_WHITE);
+                uint8_t row_buf[PORTRAIT_WIDTH / 2];
+                for (int y = 0; y < PORTRAIT_HEIGHT; y++) {
+                    size_t r = page_file.read(row_buf, sizeof(row_buf));
+                    if (r == 0) break;
+                    for (int x = 0; x < PORTRAIT_WIDTH; x++) {
+                        uint8_t byte_val = row_buf[x / 2];
+                        uint8_t color = ((x & 1) == 0) ? ((byte_val >> 4) & 0x0F) : (byte_val & 0x0F);
+                        fb_set_pixel(framebuffer, x, y, color);
+                    }
+                }
+                page_file.close();
+                
+                epd_poweron();
+                epd_clear();
+                epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+                epd_poweroff();
+            }
+        }
+    }
+    
+    // Wait for button release
+    while (digitalRead(21) == LOW || digitalRead(39) == LOW) {
+        delay(50);
+    }
+    delay(500); // Debounce
 }
 
 /**
@@ -102,7 +201,7 @@ void scan_sd_books() {
                 snprintf(books[total_books].path, sizeof(books[total_books].path), "%s", folder_path);
 
                 // 1. Read book title from title.txt if present
-                char title_file_path[100];
+                char title_file_path[120];
                 snprintf(title_file_path, sizeof(title_file_path), "%s/title.txt", folder_path);
                 if (SD.exists(title_file_path)) {
                     File tf = SD.open(title_file_path, FILE_READ);
@@ -122,31 +221,49 @@ void scan_sd_books() {
                     snprintf(books[total_books].title, sizeof(books[total_books].title), "%s", slash ? slash + 1 : folder_path);
                 }
 
-                // 2. Count pages (look for page_0000.bin, page_0001.bin, ...)
-                char test_p0[100];
-                snprintf(test_p0, sizeof(test_p0), "%s/page_0000.bin", folder_path);
-                if (SD.exists(test_p0)) {
-                    int p_count = 0;
+                // 2. Count total page files (Fast O(1) via pages.txt metadata if available)
+                int p_count = 0;
+                char meta_path[120];
+                snprintf(meta_path, sizeof(meta_path), "%s/pages.txt", folder_path);
+                if (SD.exists(meta_path)) {
+                    File meta = SD.open(meta_path, FILE_READ);
+                    if (meta) {
+                        String p = meta.readStringUntil('\n');
+                        p.trim();
+                        p_count = p.toInt();
+                        meta.close();
+                    }
+                }
+                if (p_count == 0) {
+                    // Fallback to slow scan
                     while (p_count < 9999) {
-                        char test_page[100];
+                        char test_page[120];
                         snprintf(test_page, sizeof(test_page), "%s/page_%04d.bin", folder_path, p_count);
                         if (!SD.exists(test_page)) break;
                         p_count++;
                     }
-                    books[total_books].page_count = p_count;
+                }
+                books[total_books].page_count = p_count;
 
-                    // 3. Load per-book bookmark from Flash NVS
-                    Preferences p;
-                    if (p.begin("reader", true)) {
-                        char book_key[20];
-                        snprintf(book_key, sizeof(book_key), "b_%d_p", total_books);
-                        books[total_books].current_page = p.getInt(book_key, 0);
-                        p.end();
-                    } else {
-                        books[total_books].current_page = 0;
-                    }
+                // 3. Load saved page bookmark from NVS for this book (using title hash)
+                Preferences book_prefs;
+                if (book_prefs.begin("reader", true)) {
+                    char book_key[16];
+                    uint32_t title_hash = hash_string(books[total_books].title);
+                    snprintf(book_key, sizeof(book_key), "%08X", title_hash);
+                    books[total_books].current_page = book_prefs.getInt(book_key, 0);
+                    book_prefs.end();
+                } else {
+                    books[total_books].current_page = 0;
+                }
+                
+                // Safety bounds check
+                if (books[total_books].current_page >= books[total_books].page_count) {
+                    books[total_books].current_page = 0;
+                }
 
-                    Serial.printf("[SD] Book [%d]: '%s' (%d pages, bookmark: p.%d) in %s\n",
+                if (books[total_books].page_count > 0) {
+                    Serial.printf("[SD] Discovered Book [%d]: '%s' (%d pages, bookmark: p.%d) in %s\n",
                                   total_books, books[total_books].title,
                                   books[total_books].page_count,
                                   books[total_books].current_page + 1,
@@ -165,11 +282,22 @@ void scan_sd_books() {
         snprintf(books[0].title, sizeof(books[0].title), "Livre par defaut");
 
         int p_count = 0;
-        while (p_count < 9999) {
-            char test_page[48];
-            snprintf(test_page, sizeof(test_page), "/pages/page_%04d.bin", p_count);
-            if (!SD.exists(test_page)) break;
-            p_count++;
+        if (SD.exists("/pages/pages.txt")) {
+            File meta = SD.open("/pages/pages.txt", FILE_READ);
+            if (meta) {
+                String p = meta.readStringUntil('\n');
+                p.trim();
+                p_count = p.toInt();
+                meta.close();
+            }
+        }
+        if (p_count == 0) {
+            while (p_count < 9999) {
+                char test_page[64];
+                snprintf(test_page, sizeof(test_page), "/pages/page_%04d.bin", p_count);
+                if (!SD.exists(test_page)) break;
+                p_count++;
+            }
         }
         books[0].page_count = p_count;
 
@@ -194,18 +322,16 @@ void scan_sd_books() {
 void save_current_bookmark() {
     Preferences prefs;
     if (prefs.begin("reader", false)) {
-        prefs.putInt("book_idx", current_book_idx);
+        uint32_t title_hash = hash_string(books[current_book_idx].title);
+        prefs.putUInt("last_hash", title_hash);
 
-        char book_key[20];
-        snprintf(book_key, sizeof(book_key), "b_%d_p", current_book_idx);
+        char book_key[16];
+        snprintf(book_key, sizeof(book_key), "%08X", title_hash);
         prefs.putInt(book_key, books[current_book_idx].current_page);
-
-        // Also save legacy "page" key for backward compatibility
-        prefs.putInt("page", books[current_book_idx].current_page);
         prefs.end();
 
-        Serial.printf("[NVS] Saved book [%d] bookmark: page %d\n",
-                      current_book_idx, books[current_book_idx].current_page);
+        Serial.printf("[NVS] Saved book '%s' bookmark: page %d\n",
+                      books[current_book_idx].title, books[current_book_idx].current_page);
     }
 }
 
@@ -220,9 +346,8 @@ void render_current_book_page(uint8_t *fb) {
 
     BookMetadata &b = books[current_book_idx];
 
-    // Wrap-around check
+    // Bounds check
     if (b.current_page >= b.page_count && b.page_count > 0) {
-        Serial.printf("[READER] Reached end of book. Wrapping to page 0.\n");
         b.current_page = 0;
         save_current_bookmark();
     }
@@ -231,11 +356,11 @@ void render_current_book_page(uint8_t *fb) {
         save_current_bookmark();
     }
 
-    char filename[100];
+    char filename[120];
     snprintf(filename, sizeof(filename), "%s/page_%04d.bin", b.path, b.current_page);
 
-    Serial.printf("[READER] Loading '%s' (%s, p.%d)...\n",
-                  filename, b.title, b.current_page + 1);
+    Serial.printf("[READER] Loading '%s' (%s, p.%d / %d)...\n",
+                  filename, b.title, b.current_page + 1, b.page_count);
 
     File page_file = SD.open(filename, FILE_READ);
     if (!page_file) {
@@ -243,17 +368,26 @@ void render_current_book_page(uint8_t *fb) {
         return;
     }
 
-    size_t bytes_read = page_file.read(fb, PAGE_BUFFER_SIZE);
-    page_file.close();
-
-    if (bytes_read != PAGE_BUFFER_SIZE) {
-        Serial.printf("[WARN] Incomplete page read: %u of %u bytes.\n",
-                      (unsigned int)bytes_read, (unsigned int)PAGE_BUFFER_SIZE);
+    fb_clear(fb, COLOR_WHITE);
+    uint8_t row_buf[PORTRAIT_WIDTH / 2];
+    for (int y = 0; y < PORTRAIT_HEIGHT; y++) {
+        size_t r = page_file.read(row_buf, sizeof(row_buf));
+        if (r == 0) break;
+        for (int x = 0; x < PORTRAIT_WIDTH; x++) {
+            uint8_t byte_val = row_buf[x / 2];
+            uint8_t color;
+            if ((x & 1) == 0) {
+                color = (byte_val >> 4) & 0x0F;
+            } else {
+                color = byte_val & 0x0F;
+            }
+            fb_set_pixel(fb, x, y, color);
+        }
     }
+    page_file.close();
 
     // Refresh E-Paper display
     Serial.println(F("[EPD] Refreshing ED047TC1 e-paper panel..."));
-    epd_init();
     epd_poweron();
     epd_clear();
     epd_draw_grayscale_image(epd_full_screen(), fb);
@@ -263,7 +397,6 @@ void render_current_book_page(uint8_t *fb) {
 
 /**
  * @brief Runs the interactive Library Menu on the e-paper panel.
- *        Allows the user to browse books, tap a book to read it, or resume reading.
  */
 void run_library_menu(uint8_t *fb) {
     int lib_page = current_book_idx / BOOKS_PER_PAGE;
@@ -271,7 +404,6 @@ void run_library_menu(uint8_t *fb) {
 
     // Initial render of the library screen
     fb_render_library_screen(fb, books, total_books, current_book_idx, lib_page, BOOKS_PER_PAGE);
-    epd_init();
     epd_poweron();
     epd_clear();
     epd_draw_grayscale_image(epd_full_screen(), fb);
@@ -279,17 +411,17 @@ void run_library_menu(uint8_t *fb) {
 
     Serial.println(F("[MENU] Library menu active. Waiting for touch selection..."));
 
-    // Interactive touch loop (25 seconds timeout to save battery)
+    // Interactive touch loop with 30s timeout
     uint32_t menu_start = millis();
-    constexpr uint32_t MENU_TIMEOUT_MS = 25000;
+    constexpr uint32_t MENU_TIMEOUT_MS = 30000;
 
     while (millis() - menu_start < MENU_TIMEOUT_MS) {
-        uint16_t tx = 0, ty = 0;
-        if (Touch.read(&tx, &ty)) {
+        int16_t tx = 0, ty = 0;
+        if (read_touch_point(&tx, &ty)) {
             Serial.printf("[MENU] Touch detected at (%d, %d)\n", tx, ty);
-            menu_start = millis(); // Reset timeout on user interaction
+            menu_start = millis();
 
-            // Check Footer Buttons: y in [860..940]
+            // Check Footer Buttons: y in [850..950]
             if (ty >= 850 && ty <= 950) {
                 if (tx >= 20 && tx <= 160) {
                     // PREV library page
@@ -301,7 +433,7 @@ void run_library_menu(uint8_t *fb) {
                         epd_draw_grayscale_image(epd_full_screen(), fb);
                         epd_poweroff();
                     }
-                    delay(250);
+                    delay(300);
                     continue;
                 } else if (tx >= 180 && tx <= 360) {
                     // RESUME reading current book
@@ -318,7 +450,7 @@ void run_library_menu(uint8_t *fb) {
                         epd_draw_grayscale_image(epd_full_screen(), fb);
                         epd_poweroff();
                     }
-                    delay(250);
+                    delay(300);
                     continue;
                 }
             }
@@ -333,16 +465,24 @@ void run_library_menu(uint8_t *fb) {
             for (int i = start_idx; i < end_idx; i++) {
                 int slot = i - start_idx;
                 int cy = y_start + slot * (card_h + card_sp);
-                if (ty >= cy && ty <= cy + card_h && tx >= 20 && tx <= EPD_WIDTH - 20) {
+                if (ty >= cy && ty <= cy + card_h && tx >= 20 && tx <= PORTRAIT_WIDTH - 20) {
                     Serial.printf("[MENU] Selected book [%d]: '%s'\n", i, books[i].title);
                     current_book_idx = i;
                     save_current_bookmark();
                     current_mode = MODE_READING;
-                    delay(250);
+                    delay(300);
                     return;
                 }
             }
         }
+
+        // BOOT button short press: exit menu and resume
+        if (is_any_button_pressed()) {
+            delay(200);
+            current_mode = MODE_READING;
+            return;
+        }
+
         delay(30);
     }
 
@@ -350,121 +490,184 @@ void run_library_menu(uint8_t *fb) {
     current_mode = MODE_READING;
 }
 
+void clear_i2c_bus() {
+    pinMode(BOARD_SDA, INPUT_PULLUP);
+    pinMode(BOARD_SCL, OUTPUT);
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(BOARD_SCL, LOW);
+        delayMicroseconds(5);
+        digitalWrite(BOARD_SCL, HIGH);
+        delayMicroseconds(5);
+        if (digitalRead(BOARD_SDA) == HIGH) {
+            break;
+        }
+    }
+    pinMode(BOARD_SCL, INPUT);
+}
+
 void setup() {
     Serial.begin(115200);
+    clear_i2c_bus(); // Free I2C bus if GT911 is holding it low
+    delay(3000);
+
     Serial.println(F("\n========================================================"));
     Serial.println(F(" LilyGo T5 4.7\" S3 Touch Reader & Multi-Book Library"));
     Serial.println(F("========================================================"));
 
-    // 1. Determine Wakeup Reason
-    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
-    Serial.printf("[WAKE] Wakeup cause: %d\n", wakeup_cause);
+    // Configure physical buttons
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(21, INPUT_PULLUP); // SIDE_BUTTON_PIN
+    pinMode(39, INPUT_PULLUP); // SENSOP_VN
 
-    // 2. Initialize Touch Controller (I2C)
-    Touch.begin();
+    // 1. Initialize E-Paper hardware & allocate PSRAM framebuffer
+    Serial.println(F("[EPD] Initializing ED047TC1 panel..."));
+    epd_init();
+    epd_poweron();
+    epd_clear();
+    epd_poweroff();
 
-    // 3. Initialize Custom SPI Bus and MicroSD Card
-    sd_spi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, sd_spi, SD_SPI_FREQ)) {
-        Serial.println(F("[ERROR] MicroSD card mount failed! Check card and FAT32 format."));
-        enter_deep_sleep();
+    framebuffer = (uint8_t *)ps_malloc(PAGE_BUFFER_SIZE);
+    if (!framebuffer) {
+        framebuffer = (uint8_t *)malloc(PAGE_BUFFER_SIZE);
     }
 
-    // 4. Scan Books from SD
+    if (!framebuffer) {
+        Serial.println(F("[ERROR] PSRAM/RAM framebuffer allocation failed!"));
+        epd_poweroff();
+        while(true) delay(100);
+    }
+    memset(framebuffer, 0xFF, PAGE_BUFFER_SIZE); // Clear to white
+
+    // 2. Initialize Touch Controller
+    init_touch();
+
+    // 3. Initialize MicroSD Card on SPI bus (pins from utilities.h)
+    Serial.println(F("[SD] Initializing MicroSD card..."));
+    SPI.begin(SD_SCLK, SD_MISO, SD_MOSI);
+    bool sd_ok = SD.begin(SD_CS, SPI);
+    if (!sd_ok) {
+        // Retry at lower clock speed
+        sd_ok = SD.begin(SD_CS, SPI, 10000000);
+    }
+
+    if (!sd_ok) {
+        Serial.println(F("[ERROR] MicroSD card mount failed! Check card and FAT32 format."));
+        fb_render_status_screen(
+            framebuffer,
+            "CARTE MICROSD NON DETECTEE",
+            "Attention / SD non trouvee",
+            "1. Inserez une carte MicroSD formatee en FAT32",
+            "2. Placez vos livres dans le dossier /books/",
+            "Broches SPI : SCK=11, MOSI=15, MISO=16, CS=42",
+            "Inserez la carte SD puis appuyez sur BOOT."
+        );
+        epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+        epd_poweroff();
+
+        // Go to deep sleep immediately, the screen will retain the error message
+        while(true) delay(100);
+    }
+
+    Serial.printf("[SD] MicroSD mounted successfully. Size: %.2f GB\n",
+                  SD.cardSize() / (1024.0 * 1024.0 * 1024.0));
+
+    // 4. Scan books on SD card
     scan_sd_books();
     if (total_books == 0) {
-        Serial.println(F("[ERROR] No books found on SD card! Place pages in /books/<name>/ or /pages/."));
-        SD.end();
-        enter_deep_sleep();
+        Serial.println(F("[WARN] No books found on SD card!"));
+        fb_render_status_screen(
+            framebuffer,
+            "AUCUN LIVRE SUR LA CARTE SD",
+            "Carte SD detectee (FAT32 OK)",
+            "La carte SD fonctionne mais aucun livre",
+            "n a ete detecte dans /books/ ou /pages/.",
+            "Utilisez 'python tools/convert.py mon_livre.epub'",
+            "Copiez les dossiers dans /books/ puis redemarrez."
+        );
+        epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+        epd_poweroff();
+
+        // Go to deep sleep immediately
+        while(true) delay(100);
     }
 
-    // 5. Restore Active Book Index from NVS
+    // 5. Restore active book index from NVS
     Preferences prefs;
     if (prefs.begin("reader", true)) {
-        current_book_idx = prefs.getInt("book_idx", 0);
-        if (current_book_idx >= total_books || current_book_idx < 0) {
-            current_book_idx = 0;
+        uint32_t last_book_hash = prefs.getUInt("last_hash", 0);
+        current_book_idx = 0;
+        for (int i = 0; i < total_books; i++) {
+            if (hash_string(books[i].title) == last_book_hash) {
+                current_book_idx = i;
+                break;
+            }
         }
         prefs.end();
     }
 
-    // 6. Handle User Action (Touch / BOOT Button / Reset)
-    bool button_long_press = false;
-    if (digitalRead(BUTTON_PIN) == LOW) {
-        uint32_t press_start = millis();
-        while (digitalRead(BUTTON_PIN) == LOW && millis() - press_start < 1300) {
-            delay(20);
-        }
-        if (millis() - press_start >= 1200) {
-            button_long_press = true;
-            Serial.println(F("[INPUT] BOOT button long press detected -> opening Library Menu!"));
-        }
+
+
+    if (current_mode == MODE_LIBRARY) {
+        run_library_menu(framebuffer);
     }
 
-    uint16_t touch_x = 0, touch_y = 0;
-    bool has_touch = Touch.poll(&touch_x, &touch_y, 70);
+    // Render initial page
+    render_current_book_page(framebuffer);
+    last_activity_time = millis();
+}
 
-    if (button_long_press) {
-        current_mode = MODE_LIBRARY;
-    } else if (has_touch) {
-        Serial.printf("[TOUCH] Wakeup touch registered at (%d, %d)\n", touch_x, touch_y);
-        if (touch_y < 120) {
-            // Tapping top header zone opens Library Menu
-            Serial.println(F("[TOUCH] Header tap -> opening Library Menu!"));
-            current_mode = MODE_LIBRARY;
-        } else if (touch_x < 220) {
-            // Tapping left zone goes to previous page
+void loop() {
+    // 1. Inactivity timeout check -> Auto-lock
+    if (!is_locked && millis() - last_activity_time > INACTIVITY_TIMEOUT_MS) {
+        toggle_lock_state();
+    }
+
+    // 2. Check Touch Input
+    int16_t tx = 0, ty = 0;
+    if (!is_locked && read_touch_point(&tx, &ty)) {
+        Serial.printf("[TOUCH] Registered at (%d, %d)\n", tx, ty);
+        last_activity_time = millis();
+
+        if (ty < 180) {
+            // Top Header (generous 180px height): Open Library Menu
+            Serial.println(F("[TOUCH] Header tap -> Opening Library Menu!"));
+            run_library_menu(framebuffer);
+            render_current_book_page(framebuffer);
+            last_activity_time = millis();
+        } else if (tx < 220) {
+            // Left Zone: Previous Page
             Serial.println(F("[TOUCH] Left tap -> Previous page (page--)"));
             if (books[current_book_idx].current_page > 0) {
                 books[current_book_idx].current_page--;
                 save_current_bookmark();
+                render_current_book_page(framebuffer);
             }
-            current_mode = MODE_READING;
         } else {
-            // Tapping right zone advances to next page
+            // Right Zone: Next Page
             Serial.println(F("[TOUCH] Right tap -> Next page (page++)"));
             books[current_book_idx].current_page++;
             save_current_bookmark();
-            current_mode = MODE_READING;
+            render_current_book_page(framebuffer);
         }
-    } else if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0 || 
-              (wakeup_cause == ESP_SLEEP_WAKEUP_EXT1 && digitalRead(BUTTON_PIN) == LOW)) {
-        // BOOT Button short press
-        Serial.println(F("[BUTTON] BOOT button pressed -> Next page (page++)"));
-        books[current_book_idx].current_page++;
-        save_current_bookmark();
-        current_mode = MODE_READING;
-    } else {
-        // Cold boot (slide switch toggled ON) or unknown reset: maintain current page
-        Serial.printf("[BOOT] Power-on / reset -> maintaining book [%d] at page %d\n",
-                      current_book_idx, books[current_book_idx].current_page + 1);
-        current_mode = MODE_READING;
+
+        // Wait for finger release and clear lingering touch events
+        int16_t dump_x, dump_y;
+        while (read_touch_point(&dump_x, &dump_y)) {
+            delay(10);
+        }
+        delay(100); // Small debounce after release
+    }
+    // 3. Check Physical Buttons (21, 39) for Manual Lock/Sleep (requires holding for 1 second)
+    if (digitalRead(21) == LOW || digitalRead(39) == LOW) {
+        uint32_t press_start = millis();
+        while ((digitalRead(21) == LOW || digitalRead(39) == LOW) && millis() - press_start < 1000) {
+            delay(20);
+        }
+        if (millis() - press_start >= 1000) {
+            Serial.println(F("[BUTTON] Physical button hold -> Toggling lock state!"));
+            toggle_lock_state();
+        }
     }
 
-    // 7. Allocate PSRAM Framebuffer
-    uint8_t *fb = (uint8_t *)ps_malloc(PAGE_BUFFER_SIZE);
-    if (!fb) {
-        Serial.println(F("[ERROR] PSRAM framebuffer allocation failed!"));
-        SD.end();
-        enter_deep_sleep();
-    }
-
-    // 8. Execute Operating Mode
-    if (current_mode == MODE_LIBRARY) {
-        run_library_menu(fb);
-    }
-
-    // Render current book page
-    render_current_book_page(fb);
-
-    // 9. Cleanup & Enter Deep Sleep
-    free(fb);
-    fb = nullptr;
-    SD.end();
-
-    enter_deep_sleep();
-}
-
-void loop() {
-    // Execution will never reach loop() as esp_deep_sleep_start() terminates setup()
+    delay(20);
 }

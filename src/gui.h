@@ -11,8 +11,13 @@
 #include <string.h>
 #include "font8x8.h"
 
-#define EPD_WIDTH  540
-#define EPD_HEIGHT 960
+// Display Portrait Dimensions (540x960)
+#ifndef PORTRAIT_WIDTH
+#define PORTRAIT_WIDTH   540
+#endif
+#ifndef PORTRAIT_HEIGHT
+#define PORTRAIT_HEIGHT  960
+#endif
 
 // Color constants for 4-bit grayscale (0x0 = black, 0xF = white)
 #define COLOR_BLACK      0x0
@@ -23,12 +28,22 @@
 
 inline void fb_clear(uint8_t *fb, uint8_t color = COLOR_WHITE) {
     uint8_t packed = ((color & 0x0F) << 4) | (color & 0x0F);
-    memset(fb, packed, (EPD_WIDTH * EPD_HEIGHT) / 2);
+    memset(fb, packed, (PORTRAIT_WIDTH * PORTRAIT_HEIGHT) / 2);
 }
 
+// Display Native Landscape Dimensions (for memory layout)
+#define NATIVE_WIDTH   960
+#define NATIVE_HEIGHT  540
+
 inline void fb_set_pixel(uint8_t *fb, int x, int y, uint8_t color) {
-    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) return;
-    size_t idx = (size_t)y * EPD_WIDTH + x;
+    if (x < 0 || x >= PORTRAIT_WIDTH || y < 0 || y >= PORTRAIT_HEIGHT) return;
+    
+    // Map Portrait (540x960) to Native Landscape (960x540)
+    // Physical rotation: 90 degrees counter-clockwise (USB at bottom)
+    int nx = y;
+    int ny = 539 - x;
+
+    size_t idx = (size_t)ny * NATIVE_WIDTH + nx;
     size_t byte_idx = idx / 2;
     if ((idx & 1) == 0) {
         fb[byte_idx] = (fb[byte_idx] & 0x0F) | ((color & 0x0F) << 4);
@@ -137,9 +152,9 @@ inline void fb_render_library_screen(
     fb_clear(fb, COLOR_WHITE);
 
     // 1. Header Bar
-    fb_draw_rect(fb, 0, 0, EPD_WIDTH, 85, COLOR_BLACK, true);
-    fb_draw_string(fb, 24, 18, "BIBLIOTHEQUE / LIBRARY", COLOR_WHITE, 3);
-    fb_draw_string(fb, 26, 56, "Touchez un livre pour commencer la lecture", COLOR_LIGHT_GRAY, 2);
+    fb_draw_rect(fb, 0, 0, PORTRAIT_WIDTH, 85, COLOR_BLACK, true);
+    fb_draw_string(fb, 5, 18, "BIBLIOTHEQUE / LIBRARY", COLOR_WHITE, 3);
+    fb_draw_string(fb, 10, 56, "Touchez un livre pour commencer la lecture", COLOR_LIGHT_GRAY, 2);
 
     // 2. Book Cards
     int start_idx = current_lib_page * books_per_page;
@@ -149,7 +164,7 @@ inline void fb_render_library_screen(
     int card_spacing = 18;
 
     if (total_books == 0) {
-        fb_draw_rounded_rect(fb, 30, 200, EPD_WIDTH - 60, 240, 8, COLOR_MID_GRAY, false);
+        fb_draw_rounded_rect(fb, 30, 200, PORTRAIT_WIDTH - 60, 240, 8, COLOR_MID_GRAY, false);
         fb_draw_string(fb, 50, 250, "Aucun livre detecte !", COLOR_BLACK, 3);
         fb_draw_string(fb, 50, 310, "Copiez des dossiers de livres dans", COLOR_DARK_GRAY, 2);
         fb_draw_string(fb, 50, 340, "/books/<nom_livre>/ sur la carte SD.", COLOR_BLACK, 2);
@@ -163,12 +178,12 @@ inline void fb_render_library_screen(
         // Draw card boundary
         if (is_current) {
             // Highlight active book with double border and badge
-            fb_draw_rounded_rect(fb, 20, card_y, EPD_WIDTH - 40, card_height, 6, COLOR_BLACK, false);
-            fb_draw_rounded_rect(fb, 22, card_y + 2, EPD_WIDTH - 44, card_height - 4, 4, COLOR_BLACK, false);
-            fb_draw_rect(fb, EPD_WIDTH - 150, card_y + 12, 115, 26, COLOR_BLACK, true);
-            fb_draw_string(fb, EPD_WIDTH - 142, card_y + 16, "EN COURS", COLOR_WHITE, 2);
+            fb_draw_rounded_rect(fb, 20, card_y, PORTRAIT_WIDTH - 40, card_height, 6, COLOR_BLACK, false);
+            fb_draw_rounded_rect(fb, 22, card_y + 2, PORTRAIT_WIDTH - 44, card_height - 4, 4, COLOR_BLACK, false);
+            fb_draw_rect(fb, PORTRAIT_WIDTH - 150, card_y + 12, 115, 26, COLOR_BLACK, true);
+            fb_draw_string(fb, PORTRAIT_WIDTH - 142, card_y + 16, "EN COURS", COLOR_WHITE, 2);
         } else {
-            fb_draw_rounded_rect(fb, 20, card_y, EPD_WIDTH - 40, card_height, 6, COLOR_MID_GRAY, false);
+            fb_draw_rounded_rect(fb, 20, card_y, PORTRAIT_WIDTH - 40, card_height, 6, COLOR_MID_GRAY, false);
         }
 
         // Book title (truncate if too long)
@@ -190,7 +205,7 @@ inline void fb_render_library_screen(
         // Progress Bar
         int bar_x = 38;
         int bar_y = card_y + 102;
-        int bar_w = EPD_WIDTH - 76;
+        int bar_w = PORTRAIT_WIDTH - 76;
         int bar_h = 16;
         fb_draw_rect(fb, bar_x, bar_y, bar_w, bar_h, COLOR_MID_GRAY, false);
         int fill_w = (bar_w - 4) * percent / 100;
@@ -201,7 +216,7 @@ inline void fb_render_library_screen(
 
     // 3. Footer Navigation Bar
     int footer_y = 860;
-    fb_draw_hline(fb, 0, footer_y - 15, EPD_WIDTH, COLOR_LIGHT_GRAY);
+    fb_draw_hline(fb, 0, footer_y - 15, PORTRAIT_WIDTH, COLOR_LIGHT_GRAY);
 
     // Prev Page Button (Left)
     fb_draw_rounded_rect(fb, 20, footer_y, 140, 65, 4, COLOR_BLACK, false);
@@ -221,3 +236,48 @@ inline void fb_render_library_screen(
     snprintf(lib_page_str, sizeof(lib_page_str), "Biblio %d / %d", current_lib_page + 1, total_lib_pages);
     fb_draw_string(fb, 210, 935, lib_page_str, COLOR_MID_GRAY, 2);
 }
+
+/**
+ * @brief Renders a clear informational or diagnostic screen on the E-Paper display.
+ */
+inline void fb_render_status_screen(
+    uint8_t *fb,
+    const char *title,
+    const char *subtitle,
+    const char *info1,
+    const char *info2,
+    const char *info3,
+    const char *action_hint
+) {
+    fb_clear(fb, COLOR_WHITE);
+
+    // 1. Header Bar
+    fb_draw_rect(fb, 0, 0, PORTRAIT_WIDTH, 90, COLOR_BLACK, true);
+    fb_draw_string(fb, 5, 20, "LISEUSE E-PAPER LILYGO", COLOR_WHITE, 3);
+    fb_draw_string(fb, 10, 60, subtitle ? subtitle : "System Status", COLOR_LIGHT_GRAY, 2);
+
+    // 2. Center Card
+    fb_draw_rounded_rect(fb, 10, 120, PORTRAIT_WIDTH - 20, 520, 8, COLOR_BLACK, false);
+    fb_draw_rounded_rect(fb, 12, 122, PORTRAIT_WIDTH - 24, 516, 6, COLOR_MID_GRAY, false);
+
+    // Title banner inside card
+    fb_draw_rect(fb, 20, 140, PORTRAIT_WIDTH - 40, 50, COLOR_DARK_GRAY, true);
+    if (title) fb_draw_string(fb, 25, 155, title, COLOR_WHITE, 2);
+
+    // Info lines
+    if (info1) fb_draw_string(fb, 25, 220, info1, COLOR_BLACK, 2);
+    if (info2) fb_draw_string(fb, 25, 270, info2, COLOR_BLACK, 2);
+    if (info3) fb_draw_string(fb, 25, 320, info3, COLOR_BLACK, 2);
+
+    // Action Hint Box
+    if (action_hint) {
+        fb_draw_rounded_rect(fb, 40, 420, PORTRAIT_WIDTH - 80, 180, 6, COLOR_MID_GRAY, false);
+        fb_draw_string(fb, 55, 440, "ACTION REQUISE :", COLOR_BLACK, 2);
+        fb_draw_string(fb, 55, 480, action_hint, COLOR_DARK_GRAY, 2);
+    }
+
+    // 3. Footer
+    fb_draw_hline(fb, 0, 880, PORTRAIT_WIDTH, COLOR_LIGHT_GRAY);
+    fb_draw_string(fb, 25, 915, "Appuyez sur BOOT pour rafraichir", COLOR_MID_GRAY, 2);
+}
+
